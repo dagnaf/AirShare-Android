@@ -110,8 +110,17 @@ public class BLECentral {
         @Override
         public void onLeScan(BluetoothDevice device, int rssi, byte[] scanRecord) {
             List<UUID> records = parseUuids(scanRecord);
-            if (records.contains(serviceUUID))
-                handleNewlyScannedDevice(device);
+            if (records.contains(serviceUUID)) {
+                Map<byte[], byte[]> serviceData = parseServiceData(scanRecord);
+                if (serviceData.size() != 1) {
+                    Timber.d("OnLeScan service data not found correctly.");
+                    return;
+                }
+                int scanNonce = ByteBuffer.wrap((byte[]) serviceData.values().toArray()[0]).getInt();
+                Timber.d("OnLeScan scanNonce %d %s advNonce %d.", scanNonce, scanNonce > BLEPeripheral.ADVERTISE_NONCE ? "> (handle)" : "<= (skip)", BLEPeripheral.ADVERTISE_NONCE);
+                if (scanNonce > BLEPeripheral.ADVERTISE_NONCE)
+                    handleNewlyScannedDevice(device);
+            }
         }
     };
 
@@ -169,20 +178,18 @@ public class BLECentral {
                         if (characteristicSet != null) { // Have we handled unsubscription on DISCONNECTING?
                             for (BluetoothGattCharacteristic characteristic : characteristicSet) {
                                 if (notifyUUIDs.contains(characteristic.getUuid())) {
-                                    Timber.d("Attempting to unsubscribe before disconnet");
+                                    Timber.d("Attempting to unsubscribe chara %s before disconnet", characteristic.getUuid());
                                     setIndicationSubscription(gatt, characteristic, false);
                                 }
                             }
                             // Gatt will be closed on result of descriptor write
-                        } else
+                        } else {
+                            Timber.d("Try to directly close gatt for %s since no need to unsubscribe empty characteristic list.", gatt.getDevice().getAddress());
                             gatt.close(); // Could also try to re-connect
+                        }
 
                         discoveredCharacteristics.remove(gatt.getDevice().getAddress());
-
-                        if (isScanningRequested) {
-                            Timber.d("Resuming BLE scan on device disconnect");
-                            startScanning();
-                        }
+                        resumeScanning();
 
                         break;
 
@@ -210,8 +217,9 @@ public class BLECentral {
             boolean firstMtuNegotiation = !mtus.containsKey(gatt.getDevice().getAddress());
             mtus.put(gatt.getDevice().getAddress(), mtu);
 
-
+            Timber.d("firstMtuNegotiation %b.", firstMtuNegotiation);
             if (firstMtuNegotiation) {
+                resumeScanning();
                 transportCallback.identifierUpdated(BLETransportCallback.DeviceType.CENTRAL,
                         gatt.getDevice().getAddress(),
                         Transport.ConnectionStatus.CONNECTED,
@@ -233,6 +241,12 @@ public class BLECentral {
                     Timber.d("Discovered service %s", service.getUuid().toString());
                     if (service.getUuid().equals(serviceUUID)) {
                         Timber.d("Discovered target Service");
+                        if (service.getCharacteristics().size() == 0) {
+                            Timber.w("No target characteristic is found.");
+                            refreshDeviceCache(gatt);
+                            gatt.disconnect();
+                            return;
+                        }
                         foundService = true;
                         HashSet<BluetoothGattCharacteristic> characteristicSet = new HashSet<>();
                         characteristicSet.addAll(service.getCharacteristics());
@@ -251,6 +265,7 @@ public class BLECentral {
                 }
 
                 if (foundService) {
+                    Timber.d("Put (%s,gatt) to conncetedDevices.", gatt.getDevice().getAddress());
                     synchronized (connectedDevices) {
                         connectedDevices.put(gatt.getDevice().getAddress(), gatt);
                     }
@@ -282,15 +297,24 @@ public class BLECentral {
         private void setIndicationSubscription(BluetoothGatt peripheral,
                                                BluetoothGattCharacteristic characteristic,
                                                boolean enable) {
-
+            Timber.d("Try to set indication subscription for %s.", peripheral.getDevice().getAddress());
             boolean success = peripheral.setCharacteristicNotification(characteristic, enable);
             Timber.d("Request notification %s %s with sucess %b", enable ? "set" : "unset", characteristic.getUuid().toString(), success);
             BluetoothGattDescriptor desc = characteristic.getDescriptor(CLIENT_CHARACTERISTIC_CONFIG);
             if (desc != null) {
                 Timber.d("Found client config descriptor");
-                desc.setValue(enable ? BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE : BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE);
+                desc.setValue(enable ? BluetoothGattDescriptor.ENABLE_INDICATION_VALUE : BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE);
                 boolean desSuccess = peripheral.writeDescriptor(desc);
-                Timber.d("Wrote descriptor %s with success %b", enable ? "enable" : "disable", desSuccess);
+                Timber.d("Init write descriptor %s with success %b", enable ? "enable" : "disable", desSuccess);
+                if (!desSuccess) {
+                    if (enable) {
+                        Timber.d("Try to disconnect since write descriptor fail to enable indication");
+                        peripheral.disconnect();
+                    } else {
+                        Timber.d("Try to close gatt since write descriptor fail to disable indication");
+                        peripheral.close();
+                    }
+                }
             } else if (enable && transportCallback != null) {
 
                 Timber.d("Did not find client config descriptor.");
@@ -298,6 +322,7 @@ public class BLECentral {
                     boolean mtuSuccess = peripheral.requestMtu(BLETransport.DEFAULT_MTU_BYTES);
                     Timber.d("Request MTU upgrade with success " + mtuSuccess);
                 } else {
+                    resumeScanning();
                     transportCallback.identifierUpdated(BLETransportCallback.DeviceType.CENTRAL,
                             peripheral.getDevice().getAddress(),
                             Transport.ConnectionStatus.CONNECTED,
@@ -318,12 +343,13 @@ public class BLECentral {
             Timber.d("onDescriptorWrite with status " + status);
             if (status == BluetoothGatt.GATT_SUCCESS && transportCallback != null) {
 
-                if (Arrays.equals(descriptor.getValue(), BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)) {
+                if (Arrays.equals(descriptor.getValue(), BluetoothGattDescriptor.ENABLE_INDICATION_VALUE)) {
 
                     if (REQUEST_MTU_UPGRADE && Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
                         boolean mtuSuccess = gatt.requestMtu(BLETransport.DEFAULT_MTU_BYTES);
                         Timber.d("Request MTU upgrade with success " + mtuSuccess);
                     } else {
+                        resumeScanning();
                         transportCallback.identifierUpdated(BLETransportCallback.DeviceType.CENTRAL,
                                 gatt.getDevice().getAddress(),
                                 Transport.ConnectionStatus.CONNECTED,
@@ -437,9 +463,20 @@ public class BLECentral {
         stopScanning();
         synchronized (connectedDevices) {
             for (BluetoothGatt peripheral : connectedDevices.values()) {
+                Timber.d("Try to disconnect %s.", peripheral.getDevice().getAddress());
                 peripheral.disconnect();
             }
         }
+        Timber.d("Scanning stopped.");
+    }
+
+    public void reset() {
+        isScanning = false;
+        isScanningRequested = false;
+        discoveredCharacteristics.clear();
+        connectingDevices.clear();
+        connectedDevices.clear();
+        mtus.clear();
     }
 
     public boolean isScanning() {
@@ -448,6 +485,13 @@ public class BLECentral {
 
     public boolean isConnectedTo(String deviceAddress) {
         return connectedDevices.containsKey(deviceAddress);
+    }
+
+    public void disconnect(String identifier) {
+        Timber.d("Try to disconnect %s", identifier);
+        synchronized (connectedDevices) {
+            connectedDevices.get(identifier).disconnect();
+        }
     }
 
     public
@@ -523,6 +567,7 @@ public class BLECentral {
     }
 
     private void startScanning() {
+        Timber.d("startScanning when isScanningRequested %b, isScanning %b.", isScanningRequested, isScanning);
         if ((btAdapter != null) && (!isScanning)) {
             // Temporary abandoning Lollipop BLE Scanning due to issue with Samsung Galaxy S6
             // where device does not successfully filter by 128-bit Service UUID.
@@ -554,6 +599,8 @@ public class BLECentral {
             isScanning = true;
             Timber.d("Scanning started successfully"); // TODO : This is a lie but I can't find a way to be notified when scan is successful aside from BluetoothGatt Log
             //Toast.makeText(context, context.getString(R.string.scan_started), Toast.LENGTH_SHORT).show();
+        } else {
+            Timber.d("Denied to start scanning");
         }
     }
 
@@ -589,25 +636,36 @@ public class BLECentral {
         }
     }
 
-    private void logCharacteristic(BluetoothGattCharacteristic characteristic) {
+    private void resumeScanning() {
+        Timber.d("Try to resume scanning when isScanningRequested %b, and isScanning %b.", isScanningRequested, isScanning);
+        if (isScanningRequested) {
+            Timber.d("Resuming BLE scan on device disconnect");
+            startScanning();
+        }
+    }
+
+    /* log characteristic from server at client side always has permission 0.*/
+    public static void logCharacteristic(BluetoothGattCharacteristic characteristic) {
         StringBuilder builder = new StringBuilder();
         builder.append("characteristic uuid: ");
         builder.append(characteristic.getUuid().toString());
-        builder.append("instance: ");
+        builder.append(", instance: ");
         builder.append(characteristic.getInstanceId());
-        builder.append(" properties: ");
+        builder.append(", properties: ");
         if ((characteristic.getProperties() & BluetoothGattCharacteristic.PROPERTY_NOTIFY) == BluetoothGattCharacteristic.PROPERTY_NOTIFY)
             builder.append(" notify ");
         if ((characteristic.getProperties() & BluetoothGattCharacteristic.PROPERTY_INDICATE) == BluetoothGattCharacteristic.PROPERTY_INDICATE)
             builder.append(" indicate ");
         if ((characteristic.getProperties() & BluetoothGattCharacteristic.PROPERTY_WRITE) == BluetoothGattCharacteristic.PROPERTY_WRITE)
             builder.append(" write ");
+        if ((characteristic.getProperties() & BluetoothGattCharacteristic.PROPERTY_READ) == BluetoothGattCharacteristic.PROPERTY_READ)
+            builder.append(" read ");
 
         builder.append('(');
         builder.append(characteristic.getProperties());
         builder.append(')');
 
-        builder.append(" permissions: ");
+        builder.append(", permissions: ");
         if ((characteristic.getPermissions() & BluetoothGattCharacteristic.PERMISSION_WRITE) == BluetoothGattCharacteristic.PERMISSION_WRITE)
             builder.append(" write ");
         if ((characteristic.getPermissions() & BluetoothGattCharacteristic.PERMISSION_READ) == BluetoothGattCharacteristic.PERMISSION_READ)
@@ -616,17 +674,18 @@ public class BLECentral {
         builder.append(characteristic.getPermissions());
         builder.append(')');
 
-        builder.append(" value: ");
+        builder.append(", value: ");
         if (characteristic.getValue() != null)
             builder.append(DataUtil.bytesToHex(characteristic.getValue()));
         else
             builder.append("null");
 
-        if (characteristic.getDescriptors().size() > 0) builder.append("descriptors: [\n");
+        if (characteristic.getDescriptors().size() > 0) builder.append(", descriptors: [\n");
         for (BluetoothGattDescriptor descriptor : characteristic.getDescriptors()) {
             builder.append("{\n");
+            builder.append(" uuid: ");
             builder.append(descriptor.getUuid().toString());
-            builder.append(" permissions: ");
+            builder.append("\n permissions: ");
             builder.append(descriptor.getPermissions());
             builder.append("\n value: ");
             if (descriptor.getValue() != null)
@@ -663,10 +722,10 @@ public class BLECentral {
 
         ByteBuffer buffer = ByteBuffer.wrap(advertisedData).order(ByteOrder.LITTLE_ENDIAN);
         while (buffer.remaining() > 2) {
-            byte length = buffer.get();
+            int length = buffer.get() & 0xFF;
             if (length == 0) break;
 
-            byte type = buffer.get();
+            int type = buffer.get() & 0xFF;
             switch (type) {
                 case 0x02: // Partial list of 16-bit UUIDs
                 case 0x03: // Complete list of 16-bit UUIDs
@@ -696,6 +755,31 @@ public class BLECentral {
         return uuids;
     }
 
+    /* Temp work around to parse service data */
+    private Map<byte[], byte[]> parseServiceData(byte[] advertisedData) {
+        Map<byte[], byte[]> serviceData = new HashMap<>();
+        ByteBuffer buffer = ByteBuffer.wrap(advertisedData).order(ByteOrder.LITTLE_ENDIAN);
+        while (buffer.remaining() > 2) {
+            int length = buffer.get() & 0xFF;
+            if (length == 0) break;
+
+            int type = buffer.get() & 0xFF;
+            switch (type) {
+                case 0x16:
+                    byte[] pUuidBytes = new byte[2];
+                    byte[] data = new byte[length - 1 - 2];
+                    buffer.get(pUuidBytes);
+                    buffer.get(data);
+                    serviceData.put(pUuidBytes, data);
+                    break;
+                default:
+                    buffer.position(buffer.position() + length - 1);
+                    break;
+            }
+        }
+        return serviceData;
+    }
+
 
     /**
      * Connect to the newly scanned {@link android.bluetooth.BluetoothDevice}
@@ -706,19 +790,19 @@ public class BLECentral {
 
         if (connectedDevices.containsKey(device.getAddress())) {
             // If we're already connected, forget it
-            //Timber.d("Denied connection. Already connected to  " + scanResult.getDevice().getAddress());
+             Timber.d("Denied connection. Already connected to  " + device.getAddress());
             return;
         }
 
         if (connectingDevices.contains(device.getAddress())) {
             // If we're already connected, forget it
-            //Timber.d("Denied connection. Already connecting to  " + scanResult.getDevice().getAddress());
+             Timber.d("Denied connection. Already connecting to  " + device.getAddress());
             return;
         }
 
         if (connectionGovernor != null && !connectionGovernor.shouldConnectToAddress(device.getAddress())) {
             // If the BLEConnectionGovernor says we should not bother connecting to this peer, don't
-            //Timber.d("Denied connection. ConnectionGovernor denied  " + scanResult.getDevice().getAddress());
+             Timber.d("Denied connection. ConnectionGovernor denied  " + device.getAddress());
             return;
         }
         connectingDevices.add(device.getAddress());
@@ -742,24 +826,25 @@ public class BLECentral {
         Timber.d("Stopping BLE scan before connection proceeds");
         stopScanning();
 
-        try {
-            Method connectGattMethod = device.getClass().getMethod("connectGatt", Context.class, boolean.class, BluetoothGattCallback.class, int.class);
-            connectGattMethod.invoke(device, context, true, gattCallback, 2); // (2 == LE, 1 == BR/EDR)
-        } catch (IllegalArgumentException | InvocationTargetException | IllegalAccessException | NoSuchMethodException e) {
-            // The private API changed! Use public API
-            Timber.w("Unable to connect via private API. Using public API");
+        Handler mainHandler = new Handler(Looper.getMainLooper());
+        Runnable myRunnable = new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    Method connectGattMethod = device.getClass().getMethod("connectGatt", Context.class, boolean.class, BluetoothGattCallback.class, int.class);
+                    connectGattMethod.invoke(device, context, false, gattCallback, 2); // (2 == LE, 1 == BR/EDR)
+                } catch (IllegalArgumentException | InvocationTargetException | IllegalAccessException | NoSuchMethodException e) {
+                    // The private API changed! Use public API
+                    Timber.w("Unable to connect via private API. Using public API");
 
-            // Samsung Bug: Must call connectGatt from Main thread
-            // See: http://stackoverflow.com/questions/20069507/gatt-callback-fails-to-register
-            Handler mainHandler = new Handler(Looper.getMainLooper());
-            Runnable myRunnable = new Runnable() {
-                @Override
-                public void run() {
-                    device.connectGatt(context, true, gattCallback);
+                    // Samsung Bug: Must call connectGatt from Main thread
+                    // See: http://stackoverflow.com/questions/20069507/gatt-callback-fails-to-register
+                    device.connectGatt(context, false, gattCallback);
+
                 }
-            };
-            mainHandler.post(myRunnable);
-        }
+            }
+        };
+        mainHandler.post(myRunnable);
     }
 
     //</editor-fold>

@@ -10,6 +10,7 @@ import org.apache.commons.codec.binary.Hex;
 import org.apache.commons.codec.digest.DigestUtils;
 
 import java.io.ByteArrayOutputStream;
+import java.net.UnknownServiceException;
 import java.util.ArrayDeque;
 import java.util.HashMap;
 import java.util.Map;
@@ -128,11 +129,25 @@ public class BLETransport extends Transport implements BLETransportCallback {
     @Override
     public boolean sendData(@NonNull byte[] data, String identifier) {
 
+        if (!isConnectedTo(identifier)) {
+            if (callback.get() != null) {
+                callback.get().dataSentToIdentifier(this, data, identifier, new UnknownServiceException("Identifier is not connected"));
+            }
+            return false;
+        }
+
         queueOutgoingData(data, identifier);
 
-        if (isConnectedTo(identifier))
-            return transmitOutgoingDataForConnectedPeer(identifier);
-
+        if (isConnectedTo(identifier)) {
+            boolean initOK = transmitOutgoingDataForConnectedPeer(identifier);
+            if (!initOK) {
+                disconnect(identifier);
+                if (callback.get() != null) {
+                    callback.get().dataSentToIdentifier(this, data, identifier, new UnknownServiceException("Init write not OK"));
+                }
+            }
+            return initOK;
+        }
         return false;
     }
 
@@ -150,6 +165,12 @@ public class BLETransport extends Transport implements BLETransportCallback {
     public void stop() {
         if (isLollipop() && peripheral.isAdvertising()) peripheral.stop();
         if (central.isScanning())       central.stop();
+        outBuffers.clear();
+    }
+
+    public void reset() {
+        peripheral.reset();
+        central.reset();
     }
 
     @Override
@@ -169,6 +190,7 @@ public class BLETransport extends Transport implements BLETransportCallback {
 
     @Override
     public void dataReceivedFromIdentifier(DeviceType deviceType, byte[] data, String identifier) {
+        Timber.d("dataReceivedFromIdentifier %d from %s", data.length, identifier);
         if (callback.get() != null)
             callback.get().dataReceivedFromIdentifier(this, data, identifier);
     }
@@ -261,6 +283,14 @@ public class BLETransport extends Transport implements BLETransportCallback {
 
     private boolean isConnectedTo(String identifier) {
         return central.isConnectedTo(identifier) || (isLollipop() && peripheral.isConnectedTo(identifier));
+    }
+
+    private void disconnect(String identifier) {
+        if (central.isConnectedTo(identifier)) {
+            central.disconnect(identifier);
+        } else if (isLollipop() && peripheral.isConnectedTo(identifier)) {
+            peripheral.disconnect(identifier);
+        }
     }
 
     private static boolean isLollipop() {

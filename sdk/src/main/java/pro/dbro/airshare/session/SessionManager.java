@@ -125,6 +125,8 @@ public class SessionManager implements Transport.TransportCallback,
 
         if (recipientIdentifiers == null || recipientIdentifiers.size() == 0) { // TODO: Does HashMultiMap return null or empty collection?
             Timber.e("No Identifiers for peer %s", recipient.getAlias());
+            if (callback != null)
+                callback.peerStatusUpdated(recipient, Transport.ConnectionStatus.DISCONNECTED, false);
             return;
         }
 
@@ -366,7 +368,7 @@ public class SessionManager implements Transport.TransportCallback,
     public synchronized void dataSentToIdentifier(Transport transport, byte[] data, String identifier, Exception exception) {
 
         if (exception != null) {
-            Timber.w("Data failed to send to %s", identifier);
+            Timber.w("Data failed to send to %s with exception %s", identifier, exception);
             return;
         }
 

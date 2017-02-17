@@ -24,8 +24,11 @@ import com.google.common.collect.BiMap;
 import com.google.common.collect.HashBiMap;
 
 import java.net.UnknownServiceException;
+import java.nio.ByteBuffer;
+import java.security.SecureRandom;
 import java.util.Arrays;
 import java.util.HashSet;
+import java.util.Random;
 import java.util.Set;
 import java.util.UUID;
 
@@ -41,9 +44,12 @@ import timber.log.Timber;
 @TargetApi(Build.VERSION_CODES.LOLLIPOP)
 public class BLEPeripheral {
 
+    private static final Random RANDOM = new SecureRandom();
+    public static int ADVERTISE_NONCE = Integer.MIN_VALUE;
+
     private Set<BluetoothGattCharacteristic> characterisitics = new HashSet<>();
     /** Map of connected device addresses to devices */
-    private BiMap<String, BluetoothDevice> connectedDevices = HashBiMap.create();
+    private final BiMap<String, BluetoothDevice> connectedDevices = HashBiMap.create();
 
     public interface BLEPeripheralConnectionGovernor {
         public boolean shouldConnectToCentral(BluetoothDevice potentialPeer);
@@ -108,6 +114,13 @@ public class BLEPeripheral {
         stopAdvertising();
     }
 
+    public void reset() {
+        synchronized (connectedDevices) {
+            connectedDevices.clear();
+        }
+        isAdvertising = false;
+    }
+
     public boolean isAdvertising() {
         return isAdvertising;
     }
@@ -165,6 +178,13 @@ public class BLEPeripheral {
 
     public boolean isConnectedTo(String deviceAddress) {
         return connectedDevices.containsKey(deviceAddress);
+    }
+
+    public void disconnect(String identifier) {
+        Timber.d("Try to disconnect %s", identifier);
+        synchronized (connectedDevices) {
+            gattServer.cancelConnection(connectedDevices.get(identifier));
+        }
     }
 
     public BiMap<String, BluetoothDevice> getConnectedDeviceAddresses() {
@@ -249,12 +269,16 @@ public class BLEPeripheral {
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                     // We've disconnected
                     Timber.d("Disconnected from " + device.getAddress());
-                    connectedDevices.remove(device.getAddress());
+                    synchronized (connectedDevices) {
+                        connectedDevices.remove(device.getAddress());
+                    }
                     if (transportCallback != null)
                         transportCallback.identifierUpdated(BLETransportCallback.DeviceType.PERIPHERAL,
                                                             device.getAddress(),
                                                             Transport.ConnectionStatus.DISCONNECTED,
                                                             null);
+                } else {
+                    Timber.d("onConnectionStateChange device %s, status %d, newState %d.", device.getAddress(), status, newState);
                 }
                 super.onConnectionStateChange(device, status, newState);
             }
@@ -267,7 +291,7 @@ public class BLEPeripheral {
 
             @Override
             public void onCharacteristicWriteRequest(BluetoothDevice remoteCentral, int requestId, BluetoothGattCharacteristic characteristic, boolean preparedWrite, boolean responseNeeded, int offset, byte[] value) {
-                Timber.d("onCharacteristicWriteRequest for request %d char %s offset %d length %d responseNeeded %b", requestId, characteristic.getUuid().toString().substring(0,3), offset, value == null ? 0 : value.length, responseNeeded);
+                    Timber.d("onCharacteristicWriteRequest from %s for request %d char %s offset %d length %d responseNeeded %b", remoteCentral.getAddress(), requestId, characteristic.getUuid().toString().substring(0,3), offset, value == null ? 0 : value.length, responseNeeded);
 
                 BluetoothGattCharacteristic localCharacteristic = gattServer.getService(serviceUUID).getCharacteristic(characteristic.getUuid());
                 if (localCharacteristic != null) {
@@ -300,13 +324,13 @@ public class BLEPeripheral {
 
             @Override
             public void onDescriptorReadRequest(BluetoothDevice device, int requestId, int offset, BluetoothGattDescriptor descriptor) {
-                Timber.d("onDescriptorReadRequest %s", descriptor.toString());
+                Timber.d("onDescriptorReadRequest from %s with descriptor %s", device.getAddress(), descriptor.toString());
                 super.onDescriptorReadRequest(device, requestId, offset, descriptor);
             }
 
             @Override
             public void onDescriptorWriteRequest(BluetoothDevice device, int requestId, BluetoothGattDescriptor descriptor, boolean preparedWrite, boolean responseNeeded, int offset, byte[] value) {
-                Timber.d("onDescriptorWriteRequest %s", descriptor.toString());
+                Timber.d("onDescriptorWriteRequest from %s with descriptor %s", device.getAddress(), descriptor.toString());
                 if (Arrays.equals(value, BluetoothGattDescriptor.ENABLE_INDICATION_VALUE) && responseNeeded) {
                     boolean success = gattServer.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, BluetoothGattDescriptor.ENABLE_INDICATION_VALUE);
                     Timber.d("Sent Indication sub response with success %b", success);
@@ -316,13 +340,13 @@ public class BLEPeripheral {
 
             @Override
             public void onExecuteWrite(BluetoothDevice device, int requestId, boolean execute) {
-                Timber.d("onExecuteWrite " + device.toString() + " requestId " + requestId);
+                Timber.d("onExecuteWrite from " + device.toString() + " requestId " + requestId);
                 super.onExecuteWrite(device, requestId, execute);
             }
 
             @Override
             public void onNotificationSent(BluetoothDevice device, int status) {
-                Timber.d("onNotificationSent");
+                Timber.d("onNotificationSent to %s with status %d", device.getAddress(), status);
                 Exception exception = null;
                 if (status != BluetoothGatt.GATT_SUCCESS) {
                     String msg = "notify not successful with code " + status;
@@ -335,6 +359,12 @@ public class BLEPeripheral {
                                                            lastNotified,
                                                            device.getAddress(),
                                                            exception);
+            }
+
+            @Override
+            public void onMtuChanged(BluetoothDevice device, int mtu) {
+                Timber.d("onMtuChanged request from %s mtu %d.", device.getAddress(), mtu);
+                super.onMtuChanged(device, mtu);
             }
         };
 
@@ -362,7 +392,11 @@ public class BLEPeripheral {
 
     private AdvertiseData createAdvData() {
         AdvertiseData.Builder builder = new AdvertiseData.Builder();
-        builder.addServiceUuid(new ParcelUuid(serviceUUID));
+        ParcelUuid pUuid = new ParcelUuid(serviceUUID);
+        ADVERTISE_NONCE = RANDOM.nextInt();
+        Timber.d("Create advertisement service data %d", ADVERTISE_NONCE);
+        builder.addServiceUuid(pUuid);
+        builder.addServiceData(pUuid, ByteBuffer.allocate(4).putInt(ADVERTISE_NONCE).array());
         builder.setIncludeTxPowerLevel(false);
 //        builder.setManufacturerData(0x1234578, manufacturerData);
         return builder.build();
@@ -378,6 +412,7 @@ public class BLEPeripheral {
 
     private void stopAdvertising() {
         if (isAdvertising) {
+            Timber.d("Closing gatt server");
             gattServer.close();
             advertiser.stopAdvertising(mAdvCallback);
             isAdvertising = false;
